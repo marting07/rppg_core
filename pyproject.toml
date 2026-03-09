@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rppg-core"
+version = "0.1.0"
+description = "Shared rPPG methods and utilities for comparison and liveness projects"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "scipy>=1.12",
+  "opencv-python>=4.9",
+]
+
+[tool.setuptools]
+packages = ["rppg_core", "rppg_core.methods", "rppg_core.utils"]
+
+[tool.setuptools.package-dir]
+rppg_core = "."
+"rppg_core.methods" = "methods"
+"rppg_core.utils" = "utils"
