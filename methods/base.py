@@ -74,6 +74,10 @@ class RPPGMethod:
     def update_from_value(self, value: float) -> None:
         """Run the common pipeline for one extracted method value."""
         self._append_value(value)
+        self._refresh_hr_estimate()
+
+    def _refresh_hr_estimate(self) -> None:
+        """Recompute HR state from the current ``signal_buffer``."""
         raw_hr = self.estimate_hr_bpm()
         self.last_raw_hr = raw_hr
         if raw_hr is None:
@@ -107,6 +111,115 @@ class RPPGMethod:
     def filter_signal(self, normalized_signal: np.ndarray) -> np.ndarray:
         """Filtering stage: apply standard rPPG heart-rate band-pass."""
         return bandpass_filter(normalized_signal, fs=self.fs, low=0.75, high=4.0)
+
+    def _standardize_signal(self, signal: np.ndarray) -> np.ndarray:
+        """Return zero-mean, unit-variance version of a signal when possible."""
+        if signal.size == 0:
+            return signal
+        centered = signal - np.mean(signal)
+        std = float(np.std(centered))
+        if std <= 1e-8:
+            return centered
+        return centered / std
+
+    def _compute_candidate_spectrum(
+        self,
+        signal: np.ndarray,
+        low_hz: float = 0.75,
+        high_hz: float = 3.0,
+    ) -> dict[str, float | np.ndarray | None]:
+        """Score a candidate temporal trace using the same in-band evidence used for HR estimation."""
+        x = np.array(signal, dtype=np.float64)
+        if x.size < max(8, int(round(self.fs * 2.0))):
+            return {
+                "filtered": x,
+                "score": float("-inf"),
+                "confidence": None,
+                "peak_freq_hz": None,
+                "peak_power": None,
+            }
+
+        normalized = self.normalize_signal(x)
+        filtered = self.filter_signal(normalized)
+        if filtered.size < max(8, int(round(self.fs * 2.0))):
+            return {
+                "filtered": filtered,
+                "score": float("-inf"),
+                "confidence": None,
+                "peak_freq_hz": None,
+                "peak_power": None,
+            }
+
+        n = filtered.size
+        seg_len = int(min(n, max(int(round(self.fs * 4.0)), int(round(self.fs * self.welch_window_seconds)))))
+        if seg_len < int(self.fs * 4):
+            return {
+                "filtered": filtered,
+                "score": float("-inf"),
+                "confidence": None,
+                "peak_freq_hz": None,
+                "peak_power": None,
+            }
+
+        hop = max(1, int(round(seg_len * (1.0 - self.welch_overlap_ratio))))
+        starts = list(range(0, n - seg_len + 1, hop))
+        if not starts:
+            starts = [0]
+
+        psd_accum = None
+        freqs = None
+        valid_segments = 0
+        for start in starts:
+            seg = filtered[start : start + seg_len]
+            if seg.size != seg_len:
+                continue
+            seg = seg - np.mean(seg)
+            window = np.hanning(seg_len)
+            fft = np.fft.rfft(seg * window)
+            power = (np.abs(fft) ** 2) / max(seg_len, 1)
+            f = np.fft.rfftfreq(seg_len, d=1.0 / self.fs)
+            if psd_accum is None:
+                psd_accum = power
+                freqs = f
+            else:
+                psd_accum += power
+            valid_segments += 1
+
+        if psd_accum is None or freqs is None or valid_segments == 0:
+            return {
+                "filtered": filtered,
+                "score": float("-inf"),
+                "confidence": None,
+                "peak_freq_hz": None,
+                "peak_power": None,
+            }
+
+        psd = psd_accum / float(valid_segments)
+        mask = (freqs >= low_hz) & (freqs <= high_hz)
+        if not np.any(mask):
+            return {
+                "filtered": filtered,
+                "score": float("-inf"),
+                "confidence": None,
+                "peak_freq_hz": None,
+                "peak_power": None,
+            }
+
+        in_band_freqs = freqs[mask]
+        in_band_power = psd[mask]
+        harmonic_power = np.interp(2.0 * in_band_freqs, freqs, psd, left=0.0, right=0.0)
+        score = in_band_power + 0.5 * harmonic_power
+        peak_idx = int(np.argmax(score))
+        peak_score = float(score[peak_idx])
+        baseline = float(np.median(score) + 1e-10)
+        confidence = peak_score / baseline
+        return {
+            "filtered": filtered,
+            "score": peak_score,
+            "confidence": confidence,
+            "peak_freq_hz": float(in_band_freqs[peak_idx]),
+            "peak_power": float(in_band_power[peak_idx]),
+        }
 
     def get_filtered_signal(self) -> np.ndarray:
         """Return the current normalized and filtered signal."""

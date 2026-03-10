@@ -25,7 +25,10 @@ class ICAMethod(RPPGMethod):
         self.max_hr_jump_bpm_per_s = 14.0
 
         self.window_size = max(24, int(round(window_seconds * fs)))
-        self.latency_seconds = (self.window_size / self.fs) * 0.5
+        self.analysis_size = max(self.window_size, int(round(4.0 * fs)))
+        self.latency_seconds = (self.analysis_size / self.fs) * 0.5
+        self._tail_mean_samples = max(1, int(round(0.15 * fs)))
+        self._peak_continuity_hz = 0.35
 
         self.r_buffer: list[float] = []
         self.g_buffer: list[float] = []
@@ -38,24 +41,36 @@ class ICAMethod(RPPGMethod):
         self.b_buffer.clear()
 
     @staticmethod
-    def _fastica_one_component(x: np.ndarray, max_iter: int = 120, tol: float = 1e-6) -> np.ndarray:
-        # x shape: (n_samples, n_features), whitened and zero mean.
+    def _fastica_components(x: np.ndarray, n_components: int = 3, max_iter: int = 160, tol: float = 1e-6) -> np.ndarray:
+        """Estimate multiple ICA components with symmetric decorrelation."""
         n_features = x.shape[1]
-        w = np.ones(n_features, dtype=np.float64)
-        w /= np.linalg.norm(w) + 1e-12
+        n_components = min(max(1, n_components), n_features)
+        init = np.eye(n_features, dtype=np.float64)[:n_components].copy()
+        if init.shape[0] < n_components:
+            pad = np.ones((n_components - init.shape[0], n_features), dtype=np.float64)
+            init = np.vstack([init, pad])
+        w = init
+        for row in range(w.shape[0]):
+            w[row] /= np.linalg.norm(w[row]) + 1e-12
 
         for _ in range(max_iter):
-            wx = x @ w
+            wx = x @ w.T
             g = np.tanh(wx)
             g_prime = 1.0 - g * g
-            w_new = (x.T @ g) / x.shape[0] - np.mean(g_prime) * w
-            w_new /= np.linalg.norm(w_new) + 1e-12
-            if abs(float(np.dot(w_new, w))) > (1.0 - tol):
+            w_new = (g.T @ x) / x.shape[0] - np.diag(np.mean(g_prime, axis=0)) @ w
+
+            cov = w_new @ w_new.T
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            inv_sqrt = eigvecs @ np.diag(1.0 / np.sqrt(np.clip(eigvals, 1e-8, None))) @ eigvecs.T
+            w_new = inv_sqrt @ w_new
+
+            deltas = np.abs(np.sum(w_new * w, axis=1))
+            if np.all(deltas > (1.0 - tol)):
                 w = w_new
                 break
             w = w_new
 
-        return x @ w
+        return x @ w.T
 
     def update(self, roi_frame: np.ndarray) -> None:
         if roi_frame is None or roi_frame.size == 0:
@@ -72,14 +87,14 @@ class ICAMethod(RPPGMethod):
             self.g_buffer = self.g_buffer[excess:]
             self.b_buffer = self.b_buffer[excess:]
 
-        if len(self.r_buffer) < self.window_size:
+        if len(self.r_buffer) < self.analysis_size:
             return
 
         rgb = np.stack(
             [
-                np.array(self.r_buffer[-self.window_size :], dtype=np.float64),
-                np.array(self.g_buffer[-self.window_size :], dtype=np.float64),
-                np.array(self.b_buffer[-self.window_size :], dtype=np.float64),
+                np.array(self.r_buffer[-self.analysis_size :], dtype=np.float64),
+                np.array(self.g_buffer[-self.analysis_size :], dtype=np.float64),
+                np.array(self.b_buffer[-self.analysis_size :], dtype=np.float64),
             ],
             axis=1,
         )
@@ -92,10 +107,31 @@ class ICAMethod(RPPGMethod):
         whitener = eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ eigvecs.T
         xw = rgb @ whitener
 
-        comp = self._fastica_one_component(xw)
-        comp = comp - np.mean(comp)
-        std = float(np.std(comp))
-        if std > 1e-8:
-            comp = comp / std
+        components = self._fastica_components(xw, n_components=3)
+        green_reference = rgb[:, 1] - np.mean(rgb[:, 1])
+        best_component = None
+        best_filtered = None
+        best_key = None
 
-        self.update_from_value(float(comp[-1]))
+        for idx in range(components.shape[1]):
+            comp = self._standardize_signal(components[:, idx])
+            if float(np.dot(comp, green_reference)) < 0.0:
+                comp = -comp
+            spec = self._compute_candidate_spectrum(comp)
+            confidence = float(spec["confidence"] or 0.0)
+            score = float(spec["score"] or float("-inf"))
+            peak_freq_hz = spec["peak_freq_hz"]
+            continuity = 1.0
+            if self.last_peak_freq_hz is not None and peak_freq_hz is not None:
+                continuity = 1.0 / (1.0 + abs(float(peak_freq_hz) - self.last_peak_freq_hz) / self._peak_continuity_hz)
+            key = (confidence * continuity, confidence, score)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_component = comp
+                best_filtered = self._standardize_signal(np.array(spec["filtered"], dtype=np.float64))
+
+        if best_component is None or best_filtered is None:
+            return
+
+        tail = best_filtered[-self._tail_mean_samples :]
+        self.update_from_value(float(np.mean(tail)))

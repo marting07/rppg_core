@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from rppg_core import ChromMethod, GreenMethod, POSMethod, SSRMethod
+from rppg_core import ChromMethod, GreenMethod, ICAMethod, LGIMethod, PBVMethod, POSMethod, SSRMethod
 
 
 def roi_from_bgr(b: float, g: float, r: float, size: int = 12) -> np.ndarray:
@@ -126,6 +126,35 @@ class MethodBehaviorTests(unittest.TestCase):
             method.update(roi_from_bgr(90.0, 120.0, 100.0))
         signal = method.get_ppg_signal()
         self.assertEqual(signal.size, 5)
+
+    def test_optional_methods_recover_synthetic_hr_with_motion_contamination(self) -> None:
+        fs = 30.0
+        bpm_target = 75.0
+        freq = bpm_target / 60.0
+        methods = {
+            "ica": ICAMethod(fs=fs, buffer_size=600),
+            "pbv": PBVMethod(fs=fs, buffer_size=600),
+            "lgi": LGIMethod(fs=fs, buffer_size=600),
+        }
+        n = int(14.0 * fs)
+        for idx in range(n):
+            t = idx / fs
+            pulse = np.sin(2.0 * np.pi * freq * t)
+            motion = 0.9 * np.sin(2.0 * np.pi * 0.33 * t + 0.2)
+            illum = 0.7 * np.sin(2.0 * np.pi * 0.18 * t - 0.15)
+            r = 125.0 + 10.0 * pulse + 6.0 * motion + 4.0 * illum
+            g = 110.0 + 9.0 * np.sin(2.0 * np.pi * freq * t + 0.25) - 4.5 * motion + 3.0 * illum
+            b = 95.0 + 6.0 * np.sin(2.0 * np.pi * freq * t - 0.15) + 2.5 * motion - 2.0 * illum
+            roi = textured_roi_from_bgr(b=b, g=g, r=r)
+            for method in methods.values():
+                method.update(roi)
+
+        tolerances = {"ica": 8.0, "pbv": 8.0, "lgi": 9.0}
+        for name, method in methods.items():
+            hr = method.get_hr()
+            self.assertIsNotNone(hr)
+            assert hr is not None
+            self.assertLess(abs(hr - bpm_target), tolerances[name])
 
 
 if __name__ == "__main__":
